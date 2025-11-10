@@ -1,0 +1,580 @@
+#!/usr/bin/env python3
+# bn1_pricing_suite.py — single-file
+
+import os, sys, csv, json, math, base64, io, socket, ssl, hashlib
+import datetime as _dt
+from email.utils import parsedate_to_datetime
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+# ---------- Optional deps ----------
+try:
+    from PIL import Image, ImageTk
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
+
+try:
+    import requests
+    HAS_REQUESTS = True
+except Exception:
+    HAS_REQUESTS = False
+
+# ================= App config =================
+APP_TITLE = "BN1 Surveyors — Pricing Suite"
+WINDOW_SIZE = "1140x760"
+EXPORT_CSV = "bn1_pricing_exports.csv"
+
+# Licensing
+SECRET_SALT = "bn1_pricing_2025_secret_v2"   # keep secret; must match your generator
+REQUIRE_NETWORK_TIME = True                   # set False to allow local time fallback
+TRUSTED_TIME_HOSTS = [
+    "https://www.google.com/",
+    "https://www.cloudflare.com/",
+    "https://www.microsoft.com/",
+    "https://www.amazon.co.uk/",
+    "https://www.bbc.co.uk/",
+]
+
+# ------------------ Embedded logo (fallback if Pillow unavailable) ------------------
+EMBEDDED_LOGO_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAABaAAAAy0CAYAAADm6pFvAAAACXBIWXMAAAsTAAALEwEAmpwY"
+    "AAAgAElEQVR4nOydd3xVdb3/3+3m3s7O7uzk7u7u7s7s7u7s7t7u7u7u7u7u7u7u7u7u7u7u7"
+    "u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7"
+    "u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7"
+    "u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7"
+    "u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7"
+    "u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7"
+    "u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7"
+    "u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7"
+    "u7u7u7u7u79+Z3XcAAAgAElEQVR4nO3dQY7kKBGYV0r//8f3Y1pG0xg8rF2q5e3c7u7u7u7u7"
+    "u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u/8H8D5uF0GgAA"
+    "AABJRU5ErkJggg=="
+)
+
+# ================= Utilities =================
+def round_to_nearest_25(v: float) -> float:
+    return round(v / 25) * 25
+
+def get_desktop_dir():
+    if os.name == "nt":
+        try:
+            from ctypes import windll, create_unicode_buffer
+            CSIDL_DESKTOP = 0x0000
+            SHGFP_TYPE_CURRENT = 0
+            buf = create_unicode_buffer(260)
+            if windll.shell32.SHGetFolderPathW(None, CSIDL_DESKTOP, None, SHGFP_TYPE_CURRENT, buf) == 0:
+                p = buf.value
+                if os.path.isdir(p):
+                    return p
+        except Exception:
+            pass
+    home = os.path.expanduser("~")
+    desk = os.path.join(home, "Desktop")
+    return desk if os.path.isdir(desk) else home
+
+# ================= HTTPS time =================
+def _https_head_date(url: str, timeout: float = 5.0):
+    try:
+        if HAS_REQUESTS:
+            r = requests.head(url, timeout=timeout, allow_redirects=True)
+            date_hdr = r.headers.get("Date") or r.headers.get("date")
+            if not date_hdr:
+                return None
+            d = parsedate_to_datetime(date_hdr)
+            return d.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+        else:
+            hostname = url.split("://", 1)[1].split("/", 1)[0]
+            with socket.create_connection((hostname, 443), timeout=timeout) as sock:
+                ctx = ssl.create_default_context()
+                with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+                    ssock.sendall(
+                        b"HEAD / HTTP/1.1\r\nHost: " + hostname.encode("utf-8") +
+                        b"\r\nConnection: close\r\n\r\n"
+                    )
+                    data = b""
+                    while True:
+                        chunk = ssock.recv(4096)
+                        if not chunk:
+                            break
+                        data += chunk
+            headers = data.split(b"\r\n\r\n", 1)[0].decode(errors="ignore")
+            for line in headers.split("\r\n"):
+                if line.lower().startswith("date:"):
+                    date_hdr = line.split(":", 1)[1].strip()
+                    d = parsedate_to_datetime(date_hdr)
+                    return d.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+            return None
+    except Exception:
+        return None
+
+def get_network_utc_datetime(timeout_per_host: float = 5.0):
+    results = []
+    for url in TRUSTED_TIME_HOSTS:
+        d = _https_head_date(url, timeout=timeout_per_host)
+        if d:
+            results.append(d)
+    if not results:
+        return None
+    ts = sorted([x.timestamp() for x in results])
+    median_ts = ts[len(ts) // 2]
+    return _dt.datetime.utcfromtimestamp(median_ts)
+
+# ================= Licensing helpers =================
+def _license_digest(name: str, expiry_yyyymmdd: str) -> str:
+    payload = f"{name}|{expiry_yyyymmdd}|{SECRET_SALT}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest().upper()
+
+def make_expected_key(name: str, expiry_yyyymmdd: str) -> str:
+    h = _license_digest(name, expiry_yyyymmdd)
+    return f"BN1-{expiry_yyyymmdd}-{h[:8]}-{h[8:12]}"
+
+def validate_license_key_local(key: str, name: str):
+    try:
+        key = (key or "").strip().upper()
+        if not key.startswith("BN1-"):
+            return False, "Key format not recognised.", None
+        parts = key.split("-")
+        if len(parts) != 4:
+            return False, "Key format invalid.", None
+        expiry = parts[1]
+        exp_date = _dt.datetime.strptime(expiry, "%Y%m%d").date()
+        expected = make_expected_key(name, expiry)
+        if key != expected:
+            return False, "Name / key do not match.", None
+        return True, "", exp_date
+    except Exception as e:
+        return False, f"Validation error: {e}", None
+
+def validate_license_key_with_network_time(key: str, name: str, require_network_time: bool = REQUIRE_NETWORK_TIME):
+    ok, reason, exp_date = validate_license_key_local(key, name)
+    if not ok:
+        return False, reason
+    net_dt = get_network_utc_datetime()
+    if net_dt is None:
+        if require_network_time:
+            return False, "Network time required but unavailable. Connect to the internet and try again."
+        else:
+            today = _dt.date.today()
+            if today > exp_date:
+                return False, f"License expired on {exp_date.isoformat()} (local time)."
+            return True, ""
+    net_date = net_dt.date()
+    if net_date > exp_date:
+        return False, f"License expired on {exp_date.isoformat()} (network date {net_date.isoformat()})."
+    return True, ""
+
+# ================= Daily session cache + custom prompts =================
+def _session_cache_path():
+    base = os.getenv("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".bn1")
+    path = os.path.join(base, "BN1", "session.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+def _hash_key_for_cache(license_key: str) -> str:
+    return hashlib.sha256((license_key + "|" + SECRET_SALT).encode("utf-8")).hexdigest()
+
+def _load_session():
+    try:
+        with open(_session_cache_path(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _save_session(name: str, key_hash: str, yyyymmdd: str):
+    try:
+        with open(_session_cache_path(), "w", encoding="utf-8") as f:
+            json.dump({"name": name, "key_hash": key_hash, "date": yyyymmdd}, f)
+    except Exception:
+        pass
+
+def _today_from_network_or_local():
+    net_dt = get_network_utc_datetime()
+    if net_dt is None:
+        if REQUIRE_NETWORK_TIME:
+            return None
+        return _dt.datetime.utcnow()
+    return net_dt
+
+_ROOT = None
+def _get_root():
+    global _ROOT
+    if _ROOT is None:
+        _ROOT = tk.Tk()
+        _ROOT.withdraw()
+    return _ROOT
+
+def prompt_two_fields(title: str,
+                      label1: str, secret1: bool = False,
+                      label2: str = "", secret2: bool = False):
+    root = _get_root()
+    win = tk.Toplevel(root)
+    win.title(title)
+    win.transient(root)
+    win.grab_set()
+    win.resizable(False, False)
+
+    frm = ttk.Frame(win, padding=12)
+    frm.pack(fill="both", expand=True)
+
+    ttk.Label(frm, text=label1).grid(row=0, column=0, sticky="w")
+    var1 = tk.StringVar()
+    e1 = ttk.Entry(frm, textvariable=var1, show="*" if secret1 else "")
+    e1.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+
+    var2 = tk.StringVar()
+    e2 = None
+    if label2:
+        ttk.Label(frm, text=label2).grid(row=2, column=0, sticky="w")
+        e2 = ttk.Entry(frm, textvariable=var2, show="*" if secret2 else "")
+        e2.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+
+    btns = ttk.Frame(frm); btns.grid(row=4, column=0, sticky="e", pady=(6, 0))
+    done = {"cancel": False}
+    def on_ok(): win.destroy()
+    def on_cancel(): done["cancel"] = True; win.destroy()
+    ttk.Button(btns, text="Cancel", command=on_cancel).pack(side="right", padx=(6, 0))
+    ttk.Button(btns, text="OK", command=on_ok).pack(side="right")
+
+    e1.focus_set()
+    win.bind("<Return>", lambda e: on_ok())
+    win.bind("<Escape>", lambda e: on_cancel())
+
+    frm.columnconfigure(0, weight=1)
+    win.update_idletasks()
+    x = (win.winfo_screenwidth() - win.winfo_width()) // 2
+    y = (win.winfo_screenheight() - win.winfo_height()) // 2
+    win.geometry(f"+{x}+{y}")
+    win.wait_window()
+
+    if done["cancel"]:
+        return None, None
+    return var1.get().strip() or None, (var2.get().strip() if e2 else None)
+
+def check_license_once_per_day(app_title="BN1 Licensing"):
+    session = _load_session()
+    net_or_local_dt = _today_from_network_or_local()
+    if session and net_or_local_dt:
+        today = net_or_local_dt.strftime("%Y%m%d")
+        if session.get("date") == today and session.get("name"):
+            return session.get("name")
+
+    if net_or_local_dt is None:
+        messagebox.showerror(app_title, "Network time required but unavailable.\nPlease connect to the internet and try again.")
+        raise SystemExit(1)
+
+    user_name, license_key = prompt_two_fields(
+        app_title,
+        "Enter your full name:",
+        False,
+        "Enter your license key:",
+        True
+    )
+    if not user_name or not license_key:
+        messagebox.showerror(app_title, "Name and license key are required.")
+        raise SystemExit(1)
+
+    ok, reason = validate_license_key_with_network_time(
+        license_key, user_name, require_network_time=REQUIRE_NETWORK_TIME
+    )
+    if not ok:
+        messagebox.showerror(app_title, f"Invalid or expired license.\n{reason}\n\nContact BN1 Surveyors for a renewal key.")
+        raise SystemExit(1)
+
+    today = _today_from_network_or_local().strftime("%Y%m%d")
+    _save_session(user_name, _hash_key_for_cache(license_key), today)
+    return user_name
+
+# Destroy the hidden root once licensing is done (prevents double-Tk freeze)
+def _destroy_hidden_root():
+    global _ROOT
+    try:
+        if _ROOT is not None:
+            _ROOT.destroy()
+    except Exception:
+        pass
+    _ROOT = None
+
+# ================== App UI ==================
+def _load_embedded_logo(canvas: tk.Canvas, max_w: int, max_h: int):
+    # Try embedded base64 first, then fallback draw
+    try:
+        data = base64.b64decode(EMBEDDED_LOGO_B64)
+        if PIL_AVAILABLE:
+            img = Image.open(io.BytesIO(data)).convert("RGBA")
+            ow, oh = img.size
+            scale = min(max_w / ow, max_h / oh, 1.0)
+            nw, nh = max(1, int(ow * scale)), max(1, int(oh * scale))
+            img = img.resize((nw, nh), Image.LANCZOS)
+            img_tk = ImageTk.PhotoImage(img)
+            canvas.logo_img = img_tk
+            canvas.config(width=nw + 12, height=nh + 12)
+            canvas.delete("all")
+            canvas.create_image(6, 6, anchor="nw", image=img_tk)
+            return True
+        else:
+            img_tk = tk.PhotoImage(data=EMBEDDED_LOGO_B64)
+            canvas.logo_img = img_tk
+            canvas.config(width=img_tk.width() + 12, height=img_tk.height() + 12)
+            canvas.delete("all")
+            canvas.create_image(6, 6, anchor="nw", image=img_tk)
+            return True
+    except Exception:
+        pass
+    # Fallback drawn banner
+    canvas.delete("all"); canvas.configure(bg=canvas.master["bg"])
+    canvas.create_rectangle(0, 0, max_w, max_h, fill="#00b7d9", outline="")
+    canvas.create_text(70, max_h / 2 - 6, text="B", font=("Segoe UI", 48, "bold"), fill="white")
+    canvas.create_text(210, max_h / 2 - 6, text="BN1 SURVEYORS", font=("Segoe UI", 18, "bold"), fill="white")
+    return False
+
+def round_to_nearest_25(v: float) -> float:
+    return round(v / 25) * 25
+
+class BN1PricingApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry(WINDOW_SIZE)
+        self.minsize(1000, 660)
+        self.configure(bg="#f5f7fa")
+
+        # Last computed payloads for CSV export
+        self.last_fraew = None
+        self.last_doors = None
+        self.last_comp  = None
+        self.last_strategy = None
+        self.last_safety = None
+
+        self._setup_styles()
+        self._create_widgets()
+
+    def _setup_styles(self):
+        self.title_font = ("Segoe UI", 14, "bold")
+        self.label_font = ("Segoe UI", 11, "bold")
+        self.text_font  = ("Segoe UI", 10)
+        style = ttk.Style(self)
+        try: style.theme_use("default")
+        except Exception: pass
+        style.configure("TFrame", background=self["bg"])
+        style.configure("TLabel", background=self["bg"])
+        style.configure("TButton", padding=6)
+
+    def _create_widgets(self):
+        header = ttk.Frame(self); header.pack(fill="x", padx=12, pady=(12, 6))
+        logo_frame = ttk.Frame(header); logo_frame.pack(side="left", anchor="nw")
+        self.banner_max_w, self.banner_max_h = 300, 96
+        self.logo_canvas = tk.Canvas(
+            logo_frame, width=self.banner_max_w, height=self.banner_max_h,
+            highlightthickness=0, bg=self["bg"]
+        ); self.logo_canvas.pack()
+        _load_embedded_logo(self.logo_canvas, self.banner_max_w, self.banner_max_h)
+
+        ttk.Label(header, text="BN1 Pricing Tool", font=self.title_font).pack(side="left", padx=(12, 6), pady=(6, 0))
+        ttk.Button(header, text="Export CSV", command=self.export_consolidated_csv).pack(side="right", padx=(6, 0), pady=(6, 0))
+
+        notebook = ttk.Notebook(self); notebook.pack(fill="both", expand=True, padx=12, pady=6)
+
+        fraew_tab = ttk.Frame(notebook); notebook.add(fraew_tab, text="FRAEW")
+        doors_tab = ttk.Frame(notebook); notebook.add(doors_tab, text="Fire Doors")
+        comp_tab  = ttk.Frame(notebook); notebook.add(comp_tab,  text="Compartmentation")
+        strategy_tab = ttk.Frame(notebook); notebook.add(strategy_tab, text="Fire Strategy")
+        safety_tab   = ttk.Frame(notebook); notebook.add(safety_tab,   text="Safety Case")
+
+        self._build_fraew_tab(fraew_tab)
+        self._build_fire_doors_tab(doors_tab)
+        self._build_compartmentation_tab(comp_tab)
+        self._build_fire_strategy_tab(strategy_tab)
+        self._build_safety_case_tab(safety_tab)
+
+        self._write_results("Welcome — live previews are enabled. Compute to get full breakdown, then Export CSV to Desktop.")
+
+    # ---------- FRAEW ----------
+    def _build_fraew_tab(self, parent):
+        main = ttk.Frame(parent); main.pack(fill="both", expand=True)
+        form = ttk.Frame(main); form.pack(side="left", fill="y", padx=(0, 8), pady=6)
+
+        ttk.Label(form, text="1) Timeframe urgency (1–5; 5 = very urgent):", font=self.label_font).pack(anchor="w")
+        self.timeframe_var = tk.IntVar(value=3)
+        s = ttk.Spinbox(form, from_=1, to=5, textvariable=self.timeframe_var, width=5, font=self.text_font); s.pack(anchor="w", pady=(0, 8))
+        s.configure(command=self._fraew_preview); s.bind("<KeyRelease>", lambda e: self._fraew_preview())
+
+        ttk.Label(form, text="2) Importance of cost (−5 to +5):", font=self.label_font).pack(anchor="w")
+        self.cost_importance_var = tk.IntVar(value=0)
+        s = ttk.Spinbox(form, from_=-5, to=5, textvariable=self.cost_importance_var, width=5, font=self.text_font); s.pack(anchor="w", pady=(0, 8))
+        s.configure(command=self._fraew_preview); s.bind("<KeyRelease>", lambda e: self._fraew_preview())
+
+        self.ews1_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="3) EWS1 form required", variable=self.ews1_var).pack(anchor="w", pady=(0, 8))
+        self.ews1_var.trace_add("write", lambda *_: self._fraew_preview())
+
+        self.new_client_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="4) New client", variable=self.new_client_var).pack(anchor="w", pady=(0, 8))
+        self.new_client_var.trace_add("write", lambda *_: self._fraew_preview())
+
+        self.tri_fire_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="5) Triggered by Tri-Fire", variable=self.tri_fire_var).pack(anchor="w", pady=(0, 8))
+        self.tri_fire_var.trace_add("write", lambda *_: self._fraew_preview())
+
+        ttk.Label(form, text="6) Building height (m):", font=self.label_font).pack(anchor="w")
+        self.height_var = tk.DoubleVar(value=12.0)
+        e = ttk.Entry(form, textvariable=self.height_var, width=10, font=self.text_font); e.pack(anchor="w", pady=(0, 8))
+        e.bind("<KeyRelease>", lambda ev: self._fraew_preview())
+
+        ttk.Label(form, text="7) Difficulty / complexity (1–5):", font=self.label_font).pack(anchor="w")
+        self.difficulty_var = tk.IntVar(value=3)
+        s = ttk.Spinbox(form, from_=1, to=5, textvariable=self.difficulty_var, width=5, font=self.text_font); s.pack(anchor="w", pady=(0, 12))
+        s.configure(command=self._fraew_preview); s.bind("<KeyRelease>", lambda e: self._fraew_preview())
+
+        btns = ttk.Frame(form); btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(btns, text="Compute Price", command=self.on_compute).pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="Clear Results", command=self.clear_results).pack(side="left", padx=(0, 6))
+
+        self.preview_fraew_label = ttk.Label(form, text="Current estimate (ex VAT): –", font=("Segoe UI", 10, "bold"))
+        self.preview_fraew_label.pack(anchor="w", pady=(10, 4))
+        self.after(50, self._fraew_preview)
+
+        results = ttk.Frame(main); results.pack(side="left", fill="both", expand=True, pady=6)
+        ttk.Label(results, text="Price Summary", font=self.label_font).pack(anchor="w", pady=(0, 6))
+        self.results_text = tk.Text(results, font=self.text_font, bg="white", wrap="word", state="disabled", bd=1, relief="solid")
+        self.results_text.pack(fill="both", expand=True)
+
+    # ---------- Fire Doors ----------
+    def _build_fire_doors_tab(self, parent):
+        main = ttk.Frame(parent); main.pack(fill="both", expand=True)
+        form = ttk.Frame(main); form.pack(side="left", fill="y", padx=(0, 8), pady=6)
+
+        ttk.Label(form, text="Doors to inspect:", font=self.label_font).pack(anchor="w")
+        self.doors_count_var = tk.IntVar(value=50)
+        s = ttk.Spinbox(form, from_=0, to=10000, textvariable=self.doors_count_var, width=8, font=self.text_font); s.pack(anchor="w", pady=(0, 8))
+        s.configure(command=self._doors_preview); s.bind("<KeyRelease>", lambda e: self._doors_preview())
+
+        ttk.Label(form, text="Rate per door (£):", font=self.label_font).pack(anchor="w")
+        self.doors_rate_var = tk.DoubleVar(value=17.50)
+        s = ttk.Spinbox(form, from_=0, to=200, increment=0.5, textvariable=self.doors_rate_var, width=8, font=self.text_font); s.pack(anchor="w", pady=(0, 8))
+        s.configure(command=self._doors_preview); s.bind("<KeyRelease>", lambda e: self._doors_preview())
+
+        ttk.Label(form, text="Complexity (1–5):", font=self.label_font).pack(anchor="w")
+        self.doors_complexity_var = tk.IntVar(value=3)
+        s = ttk.Spinbox(form, from_=1, to=5, textvariable=self.doors_complexity_var, width=5, font=self.text_font); s.pack(anchor="w", pady=(0, 8))
+        s.configure(command=self._doors_preview); s.bind("<KeyRelease>", lambda e: self._doors_preview())
+
+        self.doors_portfolio_disc_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="Apply 5% portfolio discount", variable=self.doors_portfolio_disc_var).pack(anchor="w", pady=(0, 8))
+        self.doors_portfolio_disc_var.trace_add("write", lambda *_: self._doors_preview())
+
+        ttk.Button(form, text="Compute Door Price", command=self.on_compute_doors).pack(anchor="w", pady=(6, 0))
+
+        self.preview_doors_label = ttk.Label(form, text="Current estimate (ex VAT): –", font=("Segoe UI", 10, "bold"))
+        self.preview_doors_label.pack(anchor="w", pady=(10, 4))
+        self.after(50, self._doors_preview)
+
+        results = ttk.Frame(main); results.pack(side="left", fill="both", expand=True, pady=6)
+        ttk.Label(results, text="Fire Doors Price Summary", font=self.label_font).pack(anchor="w", pady=(0, 6))
+        self.results_doors_text = tk.Text(results, font=self.text_font, bg="white", wrap="word", state="disabled", bd=1, relief="solid")
+        self.results_doors_text.pack(fill="both", expand=True)
+
+    # ---------- Compartmentation ----------
+    def _build_compartmentation_tab(self, parent):
+        main = ttk.Frame(parent); main.pack(fill="both", expand=True)
+        form = ttk.Frame(main); form.pack(side="left", fill="y", padx=(0, 8), pady=6)
+
+        ttk.Label(form, text="No. of risers/shafts:", font=self.label_font).pack(anchor="w")
+        self.comp_risers_var = tk.IntVar(value=4)
+        s = ttk.Spinbox(form, from_=0, to=200, textvariable=self.comp_risers_var, width=6, font=self.text_font); s.pack(anchor="w", pady=(0, 8))
+        s.configure(command=self._comp_preview); s.bind("<KeyRelease>", lambda e: self._comp_preview())
+
+        ttk.Label(form, text="Floors to survey:", font=self.label_font).pack(anchor="w")
+        self.comp_floors_var = tk.IntVar(value=8)
+        s = ttk.Spinbox(form, from_=0, to=200, textvariable=self.comp_floors_var, width=6, font=self.text_font); s.pack(anchor="w", pady=(0, 8))
+        s.configure(command=self._comp_preview); s.bind("<KeyRelease>", lambda e: self._comp_preview())
+
+        ttk.Label(form, text="Complexity (1–5):", font=self.label_font).pack(anchor="w")
+        self.comp_complexity_var = tk.IntVar(value=3)
+        s = ttk.Spinbox(form, from_=1, to=5, textvariable=self.comp_complexity_var, width=5, font=self.text_font); s.pack(anchor="w", pady=(0, 8))
+        s.configure(command=self._comp_preview); s.bind("<KeyRelease>", lambda e: self._comp_preview())
+
+        ttk.Label(form, text="Access:", font=self.label_font).pack(anchor="w")
+        self.comp_access_means_var = tk.StringVar(value="MEWP")
+        combo = ttk.Combobox(form, textvariable=self.comp_access_means_var, values=["MEWP", "Scaffold", "Internal only"], width=18)
+        combo.pack(anchor="w", pady=(0, 8)); combo.bind("<<ComboboxSelected>>", lambda e: self._comp_preview())
+
+        ttk.Button(form, text="Compute Compartmentation Price", command=self.on_compute_compartmentation).pack(anchor="w", pady=(6, 0))
+
+        self.preview_comp_label = ttk.Label(form, text="Current estimate (ex VAT): –", font=("Segoe UI", 10, "bold"))
+        self.preview_comp_label.pack(anchor="w", pady=(10, 4))
+        self.after(50, self._comp_preview)
+
+        results = ttk.Frame(main); results.pack(side="left", fill="both", expand=True, pady=6)
+        ttk.Label(results, text="Compartmentation Price Summary", font=self.label_font).pack(anchor="w", pady=(0, 6))
+        self.results_comp_text = tk.Text(results, font=self.text_font, bg="white", wrap="word", state="disabled", bd=1, relief="solid")
+        self.results_comp_text.pack(fill="both", expand=True)
+
+    # ---------- Fire Strategy ----------
+    def _build_fire_strategy_tab(self, parent):
+        main = ttk.Frame(parent); main.pack(fill="both", expand=True)
+        form = ttk.Frame(main); form.pack(side="left", fill="y", padx=(0, 8), pady=6)
+
+        ttk.Label(form, text="No. of cores:", font=self.label_font).pack(anchor="w")
+        self.strategy_cores_var = tk.IntVar(value=1)
+        s = ttk.Spinbox(form, from_=1, to=12, textvariable=self.strategy_cores_var, width=6, font=self.text_font); s.pack(anchor="w", pady=(0, 8))
+        s.configure(command=self._strategy_preview); s.bind("<KeyRelease>", lambda e: self._strategy_preview())
+
+        ttk.Label(form, text="Distinct flat/unit types:", font=self.label_font).pack(anchor="w")
+        self.strategy_flattypes_var = tk.IntVar(value=2)
+        s = ttk.Spinbox(form, from_=1, to=20, textvariable=self.strategy_flattypes_var, width=6, font=self.text_font); s.pack(anchor="w", pady=(0, 8))
+        s.configure(command=self._strategy_preview); s.bind("<KeyRelease>", lambda e: self._strategy_preview())
+
+        ttk.Label(form, text="Documentation quality:", font=self.label_font).pack(anchor="w")
+        self.strategy_docq_var = tk.StringVar(value="Average")
+        combo = ttk.Combobox(form, textvariable=self.strategy_docq_var, values=["Good", "Average", "Poor"], width=18)
+        combo.pack(anchor="w", pady=(0, 8)); combo.bind("<<ComboboxSelected>>", lambda e: self._strategy_preview())
+
+        self.strategy_siteverify_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(form, text="Include site verification visit", variable=self.strategy_siteverify_var).pack(anchor="w", pady=(0, 8))
+        self.strategy_siteverify_var.trace_add("write", lambda *_: self._strategy_preview())
+
+        ttk.Label(form, text="Complexity (1–5):", font=self.label_font).pack(anchor="w")
+        self.strategy_complexity_var = tk.IntVar(value=3)
+        s = ttk.Spinbox(form, from_=1, to=5, textvariable=self.strategy_complexity_var, width=5, font=self.text_font); s.pack(anchor="w", pady=(0, 8))
+        s.configure(command=self._strategy_preview); s.bind("<KeyRelease>", lambda e: self._strategy_preview())
+
+        ttk.Button(form, text="Compute Fire Strategy Price", command=self.on_compute_fire_strategy).pack(anchor="w", pady=(6, 0))
+
+        self.preview_strategy_label = ttk.Label(form, text="Current estimate (ex VAT): –", font=("Segoe UI", 10, "bold"))
+        self.preview_strategy_label.pack(anchor="w", pady=(10, 4))
+        self.after(50, self._strategy_preview)
+
+        results = ttk.Frame(main); results.pack(side="left", fill="both", expand=True, pady=6)
+        ttk.Label(results, text="Fire Strategy Price Summary", font=self.label_font).pack(anchor="w", pady=(0, 6))
+        self.results_strategy_text = tk.Text(results, font=self.text_font, bg="white", wrap="word", state="disabled", bd=1, relief="solid")
+        self.results_strategy_text.pack(fill="both", expand=True)
+
+    # ---------- Safety Case ----------
+    def _build_safety_case_tab(self, parent):
+        main = ttk.Frame(parent); main.pack(fill="both", expand=True)
+        form = ttk.Frame(main); form.pack(side="left", fill="y", padx=(0, 8), pady=6)
+
+        ttk.Label(form, text="Package:", font=self.label_font).pack(anchor="w")
+        self.safety_pkg_var = tk.StringVar(value="Gap Analysis")
+        combo = ttk.Combobox(form, textvariable=self.safety_pkg_var, values=["Gap Analysis", "Full Safety Case"], width=22)
+        combo.pack(anchor="w", pady=(0, 8)); combo.bind("<<ComboboxSelected>>", lambda e: self._safety_preview())
+
+        ttk.Label(form, text="Building complexity (1–5):", font=self.label_font).pack(anchor="w")
+        self.safety_complexity_var = tk.IntVar(value=3)
+        s = ttk.Spinbox(form, from_=1, to=5, textvariable=self.safety_complexity_var, width=5, font=self.text_font); s.pack(anchor="w", pady=(0, 8))
+        s.configure(command=self._safety_preview); s.bind("<KeyRelease>", lambda e: self._safety_preview())
+
+        ttk.Label(form, text="Document completeness:", font=self.label_font).pack(anchor="w")
+        self.safety_docs_var = tk.StringVar(value="Average")
+        combo = ttk.Combobox(form, textvariable=self.safety_docs_var, values=["Complete", "Average", "Poor"], width=18)
+        combo.pack(anchor="w", pady=(0, 8)); combo.bind("<<ComboboxSelected>>", lambda e: self._safety_preview())
+
+        self.safety_portfolio_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="Portfolio / repeat-client discount (5%)", variable=self.safety_portfolio_var).pack(anchor="w", pady=(0, 8))
+        self.safety_portfolio_var.trace_add("write", lambda *_: self._safety_preview())
+
+        ttk.Button(form, text="Compute Safety Case Price", command=self.on_compute_safety_case).pack(anchor="w", pady=(6, 0))
+
+        self.preview_safety_label = ttk.L
